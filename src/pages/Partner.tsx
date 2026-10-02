@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import { supabase } from "@/integrations/supabase/client";
@@ -7,19 +7,22 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   InputOTP,
   InputOTPGroup,
   InputOTPSlot,
 } from "@/components/ui/input-otp";
 import SwipeDeck from "@/components/partner/SwipeDeck";
-import MatchChatModal from "@/components/partner/MatchChatModal";
-import { Loader2, Upload, X } from "lucide-react";
+import Inbox from "@/components/partner/Inbox";
+import ChatPanel from "@/components/partner/ChatPanel";
+import NewMatchPopup from "@/components/partner/NewMatchPopup";
+import { usePartnerInbox, type InboxMatch } from "@/hooks/usePartnerInbox";
+import { Loader2, Upload, X, Heart, Inbox as InboxIcon, UserRound } from "lucide-react";
 
 // NOTE: `partner_profiles`, `partner_matches` etc. are new tables that don't
-// exist in src/integrations/supabase/types.ts yet. Once Lovable creates them
-// (see the Lovable prompt), regenerate types and these `as any` casts can be
-// removed for full type safety.
+// exist in src/integrations/supabase/types.ts yet. These `as any` casts can
+// be removed once types.ts is regenerated against the real schema.
 const db = supabase as any;
 
 type ProfileStatus = "none" | "pending" | "approved" | "rejected" | "disabled";
@@ -40,9 +43,23 @@ type PartnerProfile = {
 const GENDERS = ["Male", "Female"];
 const LOOKING_FOR_OPTIONS = ["Male", "Female", "Anyone"];
 
+// A simple, friendly device lock: one browser/device = one account. This
+// isn't unbeatable (clearing site data resets it), but it stops casual
+// account-switching, which is the goal here.
+const DEVICE_ID_KEY = "otown_partner_device_id";
+const getDeviceId = () => {
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+  }
+  return id;
+};
+
 const Partner = () => {
   const [authLoading, setAuthLoading] = useState(true);
   const [session, setSession] = useState<any>(null);
+  const deviceId = useMemo(getDeviceId, []);
 
   // email/otp step
   const [email, setEmail] = useState("");
@@ -63,12 +80,18 @@ const Partner = () => {
   const [gender, setGender] = useState("");
   const [lookingFor, setLookingFor] = useState<string[]>([]);
   const [bio, setBio] = useState("");
+  const [existingPhotoUrls, setExistingPhotoUrls] = useState<string[]>([]);
   const [photos, setPhotos] = useState<File[]>([]);
   const [photoPreviews, setPhotoPreviews] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
-  // active match / chat
-  const [activeMatch, setActiveMatch] = useState<any | null>(null);
+  // tabs + chat
+  const [tab, setTab] = useState<"swipe" | "inbox" | "profile">("swipe");
+  const [openMatch, setOpenMatch] = useState<InboxMatch | null>(null);
+  const [chatMinimized, setChatMinimized] = useState(false);
+
+  const { matches, loading: inboxLoading, totalUnread, markRead, newMatch, clearNewMatch, reload } =
+    usePartnerInbox(session?.user?.id, chatMinimized ? null : openMatch?.id ?? null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -83,29 +106,6 @@ const Partner = () => {
 
   useEffect(() => {
     if (session?.user?.id) fetchProfile();
-  }, [session?.user?.id]);
-
-  // Listen for new matches in real time so a chat pops up the moment someone
-  // matches with you, even if you're mid-swipe.
-  useEffect(() => {
-    if (!session?.user?.id) return;
-    const channel = supabase
-      .channel("partner-matches")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "partner_matches" },
-        (payload: any) => {
-          const row = payload.new;
-          if (row.user_a === session.user.id || row.user_b === session.user.id) {
-            setActiveMatch(row);
-            toast("You matched with someone! 🎉");
-          }
-        }
-      )
-      .subscribe();
-    return () => {
-      supabase.removeChannel(channel);
-    };
   }, [session?.user?.id]);
 
   const fetchProfile = async () => {
@@ -133,7 +133,7 @@ const Partner = () => {
     if (!email.trim()) return toast.error("Enter your email first");
     setSendingOtp(true);
     const { data, error } = await supabase.functions.invoke("send-partner-otp", {
-      body: { email: email.trim() },
+      body: { email: email.trim(), device_id: deviceId },
     });
     setSendingOtp(false);
     if (error || data?.error) return toast.error(await fnError(error, data));
@@ -146,7 +146,7 @@ const Partner = () => {
     if (otp.length !== 6) return toast.error("Enter the 6-digit code");
     setVerifyingOtp(true);
     const { data, error } = await supabase.functions.invoke("verify-partner-otp", {
-      body: { email: email.trim(), code: otp },
+      body: { email: email.trim(), code: otp, device_id: deviceId },
     });
     if (error || !data?.token_hash) {
       setVerifyingOtp(false);
@@ -160,8 +160,23 @@ const Partner = () => {
     if (authErr) return toast.error(authErr.message);
   };
 
+  const startEdit = () => {
+    if (profile) {
+      setDisplayName(profile.display_name);
+      setAge(String(profile.age));
+      setGender(profile.gender);
+      setLookingFor(profile.looking_for ?? []);
+      setBio(profile.bio);
+      setExistingPhotoUrls(profile.photo_urls ?? []);
+    }
+    setPhotos([]);
+    setPhotoPreviews([]);
+    setShowForm(true);
+  };
+
   const handlePhotoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []).slice(0, 3 - photos.length);
+    const slotsLeft = 3 - existingPhotoUrls.length - photos.length;
+    const files = Array.from(e.target.files ?? []).slice(0, Math.max(0, slotsLeft));
     if (!files.length) return;
     setPhotos((p) => [...p, ...files]);
     files.forEach((f) => {
@@ -170,7 +185,11 @@ const Partner = () => {
     });
   };
 
-  const removePhoto = (idx: number) => {
+  const removeExistingPhoto = (idx: number) => {
+    setExistingPhotoUrls((p) => p.filter((_, i) => i !== idx));
+  };
+
+  const removeNewPhoto = (idx: number) => {
     setPhotos((p) => p.filter((_, i) => i !== idx));
     setPhotoPreviews((p) => p.filter((_, i) => i !== idx));
   };
@@ -186,7 +205,9 @@ const Partner = () => {
       return toast.error("Fill in every field");
     }
     if (Number(age) < 18) return toast.error("You must be 18 or older");
-    if (photos.length === 0) return toast.error("Add at least one photo");
+    if (existingPhotoUrls.length + photos.length === 0) {
+      return toast.error("Add at least one photo");
+    }
 
     setSubmitting(true);
     try {
@@ -209,7 +230,7 @@ const Partner = () => {
           gender,
           looking_for: lookingFor,
           bio: bio.trim(),
-          photo_urls: uploadedUrls,
+          photo_urls: [...existingPhotoUrls, ...uploadedUrls].slice(0, 3),
           status: "pending",
         },
         { onConflict: "user_id" }
@@ -224,6 +245,12 @@ const Partner = () => {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const openChat = (m: InboxMatch) => {
+    setOpenMatch(m);
+    setChatMinimized(false);
+    clearNewMatch();
   };
 
   // ---------- RENDER ----------
@@ -262,6 +289,9 @@ const Partner = () => {
                 <Button className="w-full" onClick={sendOtp} disabled={sendingOtp}>
                   {sendingOtp ? <Loader2 className="animate-spin" size={16} /> : "Send code"}
                 </Button>
+                <p className="text-xs text-foreground/40 text-center">
+                  One account per device — keep it fair for everyone 🙂
+                </p>
               </div>
             ) : (
               <div className="space-y-4">
@@ -295,7 +325,7 @@ const Partner = () => {
           </div>
         )}
 
-        {session && !profileLoading && !profile && !showForm && (
+        {session && !profileLoading && !profile && !showForm && !agreedDisclaimer && (
           <div className="bg-card border border-border rounded-xl p-6 space-y-4 animate-fade-up">
             <h2 className="font-display text-xl">Before you continue</h2>
             <p className="text-sm text-foreground/70 leading-relaxed">
@@ -320,9 +350,11 @@ const Partner = () => {
           </div>
         )}
 
-        {session && !profileLoading && (!profile || profile.status === "rejected") && showForm && (
+        {session && !profileLoading && (!profile || profile.status === "rejected" || (profile.status === "approved" && showForm)) && showForm && (
           <div className="bg-card border border-border rounded-xl p-6 space-y-5 animate-fade-up">
-            <h2 className="font-display text-xl">Create your profile</h2>
+            <h2 className="font-display text-xl">
+              {profile ? "Edit your profile" : "Create your profile"}
+            </h2>
 
             <div>
               <label className="text-sm text-foreground/70 block mb-1">Name</label>
@@ -387,21 +419,32 @@ const Partner = () => {
 
             <div>
               <label className="text-sm text-foreground/70 block mb-2">
-                Photos ({photos.length}/3)
+                Photos ({existingPhotoUrls.length + photos.length}/3)
               </label>
               <div className="flex gap-3 flex-wrap">
-                {photoPreviews.map((url, i) => (
-                  <div key={i} className="relative w-20 h-20">
+                {existingPhotoUrls.map((url, i) => (
+                  <div key={`existing-${i}`} className="relative w-20 h-20">
                     <img src={url} className="w-full h-full object-cover rounded-lg" />
                     <button
-                      onClick={() => removePhoto(i)}
+                      onClick={() => removeExistingPhoto(i)}
                       className="absolute -top-2 -right-2 bg-destructive rounded-full p-1"
                     >
                       <X size={12} />
                     </button>
                   </div>
                 ))}
-                {photos.length < 3 && (
+                {photoPreviews.map((url, i) => (
+                  <div key={`new-${i}`} className="relative w-20 h-20">
+                    <img src={url} className="w-full h-full object-cover rounded-lg" />
+                    <button
+                      onClick={() => removeNewPhoto(i)}
+                      className="absolute -top-2 -right-2 bg-destructive rounded-full p-1"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+                {existingPhotoUrls.length + photos.length < 3 && (
                   <label className="w-20 h-20 border border-dashed border-border rounded-lg flex items-center justify-center cursor-pointer text-foreground/50 hover:text-primary hover:border-primary">
                     <Upload size={18} />
                     <input
@@ -415,9 +458,16 @@ const Partner = () => {
               </div>
             </div>
 
-            <Button className="w-full" onClick={submitProfile} disabled={submitting}>
-              {submitting ? <Loader2 className="animate-spin" size={16} /> : "Submit for review"}
-            </Button>
+            <div className="flex gap-2">
+              {profile?.status === "approved" && (
+                <Button variant="outline" className="flex-1" onClick={() => setShowForm(false)}>
+                  Cancel
+                </Button>
+              )}
+              <Button className="flex-1" onClick={submitProfile} disabled={submitting}>
+                {submitting ? <Loader2 className="animate-spin" size={16} /> : "Submit for review"}
+              </Button>
+            </div>
           </div>
         )}
 
@@ -436,7 +486,7 @@ const Partner = () => {
             {profile.reject_reason && (
               <p className="text-sm text-foreground/60">{profile.reject_reason}</p>
             )}
-            <Button onClick={() => setShowForm(true)}>Edit & resubmit</Button>
+            <Button onClick={startEdit}>Edit & resubmit</Button>
           </div>
         )}
 
@@ -448,16 +498,97 @@ const Partner = () => {
           </div>
         )}
 
-        {session && !profileLoading && profile?.status === "approved" && (
-          <SwipeDeck currentUserId={session.user.id} />
+        {session && !profileLoading && profile?.status === "approved" && !showForm && (
+          <Tabs value={tab} onValueChange={(v) => setTab(v as any)}>
+            <TabsList className="grid grid-cols-3 w-full mb-6">
+              <TabsTrigger value="swipe" className="gap-1.5">
+                <Heart size={14} /> Swipe
+              </TabsTrigger>
+              <TabsTrigger value="inbox" className="gap-1.5 relative">
+                <InboxIcon size={14} /> Inbox
+                {totalUnread > 0 && (
+                  <span className="ml-1 min-w-5 h-5 px-1.5 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center">
+                    {totalUnread}
+                  </span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger value="profile" className="gap-1.5">
+                <UserRound size={14} /> My Profile
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="swipe">
+              <SwipeDeck currentUserId={session.user.id} />
+            </TabsContent>
+
+            <TabsContent value="inbox">
+              <Inbox
+                matches={matches}
+                loading={inboxLoading}
+                currentUserId={session.user.id}
+                onOpen={openChat}
+                onDiscover={() => setTab("swipe")}
+              />
+            </TabsContent>
+
+            <TabsContent value="profile">
+              <div className="bg-card border border-border rounded-xl overflow-hidden animate-fade-up">
+                {profile.photo_urls?.[0] && (
+                  <img src={profile.photo_urls[0]} className="w-full h-64 object-cover" />
+                )}
+                <div className="p-5 space-y-3">
+                  <div>
+                    <h3 className="font-display text-xl">
+                      {profile.display_name}, {profile.age}
+                    </h3>
+                    <p className="text-xs text-foreground/50">{profile.gender}</p>
+                  </div>
+                  <p className="text-sm text-foreground/70">{profile.bio}</p>
+                  <p className="text-xs text-foreground/50">
+                    Looking for: {profile.looking_for.join(", ")}
+                  </p>
+                  {profile.photo_urls?.length > 1 && (
+                    <div className="flex gap-2">
+                      {profile.photo_urls.slice(1).map((url, i) => (
+                        <img key={i} src={url} className="w-16 h-16 rounded-lg object-cover" />
+                      ))}
+                    </div>
+                  )}
+                  <Button variant="outline" className="w-full" onClick={startEdit}>
+                    Edit profile
+                  </Button>
+                  <p className="text-xs text-foreground/40 text-center pt-1">
+                    Editing sends your profile back for a quick re-review.
+                  </p>
+                </div>
+              </div>
+            </TabsContent>
+          </Tabs>
         )}
       </main>
 
-      {activeMatch && session && (
-        <MatchChatModal
-          match={activeMatch}
+      {openMatch && session && (
+        <ChatPanel
+          match={openMatch}
           currentUserId={session.user.id}
-          onClose={() => setActiveMatch(null)}
+          minimized={chatMinimized}
+          unread={matches.find((m) => m.id === openMatch.id)?.unread ?? 0}
+          onMinimize={() => setChatMinimized(true)}
+          onRestore={() => setChatMinimized(false)}
+          onClose={() => {
+            setOpenMatch(null);
+            setChatMinimized(false);
+            reload();
+          }}
+          onRead={() => markRead(openMatch.id)}
+        />
+      )}
+
+      {newMatch && session && !openMatch && (
+        <NewMatchPopup
+          match={newMatch}
+          onSayHi={() => openChat(newMatch)}
+          onKeepSwiping={() => clearNewMatch()}
         />
       )}
 
